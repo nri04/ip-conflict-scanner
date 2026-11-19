@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <RootNamespace>IpConflictScanner</RootNamespace>
+    <AssemblyName>IpConflictScanner</AssemblyName>
+    <StartupObject>IpConflictScanner.Program</StartupObject>
+    <MyType>Empty</MyType>
+    <OptionStrict>On</OptionStrict>
+    <OptionExplicit>On</OptionExplicit>
+    <OptionInfer>On</OptionInfer>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>1.0.0</Version>
+    <Company>NRI / Smart Electromation</Company>
+    <Product>IP Conflict Scanner</Product>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Update="oui.csv" CopyToOutputDirectory="PreserveNewest" Condition="Exists('oui.csv')" />
+  </ItemGroup>
+
+</Project>
