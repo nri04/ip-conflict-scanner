@@ -106,7 +106,15 @@ Public Enum HostFlags
     DualInterface = 512     ' les mêmes 2 MAC sont aussi en conflit sur une autre IP
     WrongSubnet = 1024      ' appareil vu en ARP avec une IP hors du sous-réseau
     Passive = 2048          ' vu par l'écoute passive ARP (Npcap)
+    Reassigned = 4096       ' l'IP est passée d'un appareil à un autre (bail DHCP) : pas un conflit
 End Enum
+
+''' <summary>Période pendant laquelle une même MAC a été vue sans interruption pour une IP.</summary>
+Public Class MacRun
+    Public Property Mac As String
+    Public Property Debut As DateTime
+    Public Property Fin As DateTime
+End Class
 
 ''' <summary>Résultat pour une IP.</summary>
 Public Class HostResult
@@ -123,30 +131,164 @@ Public Class HostResult
     Public Property Flags As HostFlags
     Public Property LastSeen As DateTime
     Public Property Notes As String = ""
+    ''' <summary>Notes calculées par l'analyse globale (recalculées à chaque analyse).</summary>
+    Public Property AnalysisNotes As String = ""
+
+    ''' <summary>Notes d'observation + notes d'analyse.</summary>
+    Public ReadOnly Property AllNotes As String
+        Get
+            Return String.Join(" ; ", {Notes, AnalysisNotes}.Where(Function(n) n <> ""))
+        End Get
+    End Property
+
+    Public Sub AddAnalysisNote(note As String)
+        If AnalysisNotes.Contains(note) Then Return
+        AnalysisNotes = If(AnalysisNotes = "", note, AnalysisNotes & " ; " & note)
+    End Sub
 
     ''' <summary>Paires "1ère réponse / dernière réponse" différentes = 2 répondeurs simultanés.</summary>
     Public ReadOnly Property ResponderPairs As New ConcurrentDictionary(Of String, Integer)(StringComparer.OrdinalIgnoreCase)
 
-    Public Sub AddMac(mac As String)
+    ''' <summary>
+    ''' Une MAC qui revient sur l'IP après une autre MAC dans ce délai (A → B → A) = conflit.
+    ''' Au-delà, ou si l'ancienne MAC ne revient pas, c'est une réattribution (bail DHCP), pas un conflit.
+    ''' </summary>
+    Public Shared ReadOnly AlternanceMax As TimeSpan = TimeSpan.FromMinutes(10)
+
+    ''' <summary>Nombre max de périodes gardées par IP (surveillance longue).</summary>
+    Private Const MaxRuns As Integer = 200
+
+    Private ReadOnly _runsLock As New Object()
+    ''' <summary>Historique chronologique des MAC vues pour cette IP.</summary>
+    Private ReadOnly _runs As New List(Of MacRun)
+
+    Public Sub AddMac(mac As String, Optional quand As DateTime = Nothing)
         If String.IsNullOrEmpty(mac) Then Return
+        If quand = DateTime.MinValue Then quand = DateTime.Now
         Macs.AddOrUpdate(mac, 1, Function(k, v) v + 1)
-        If Macs.Count > 1 Then Flags = Flags Or HostFlags.IpConflict
+        RecordRun(mac, quand)
+        UpdateConflict()
     End Sub
 
     ''' <summary>Enregistre une sonde ARP : 1ère réponse (SendARP) et dernière (cache Windows).</summary>
     ''' <returns>True si deux MAC différentes ont répondu à la même requête.</returns>
     Public Function AddProbe(firstMac As String, lastMac As String) As Boolean
-        AddMac(firstMac)
-        If String.IsNullOrEmpty(lastMac) OrElse String.IsNullOrEmpty(firstMac) Then
-            AddMac(lastMac)
+        Dim quand = DateTime.Now
+        If String.IsNullOrEmpty(firstMac) OrElse String.IsNullOrEmpty(lastMac) OrElse
+           firstMac.Equals(lastMac, StringComparison.OrdinalIgnoreCase) Then
+            AddMac(If(String.IsNullOrEmpty(firstMac), lastMac, firstMac), quand)
             Return False
         End If
-        If firstMac.Equals(lastMac, StringComparison.OrdinalIgnoreCase) Then Return False
-        Macs.AddOrUpdate(lastMac, 1, Function(k, v) v + 1)
+        ' deux machines ont répondu à la MÊME requête : conflit certain
         ResponderPairs.AddOrUpdate($"1ère={firstMac} / dernière={lastMac}", 1, Function(k, v) v + 1)
-        Flags = Flags Or HostFlags.IpConflict
+        Macs.AddOrUpdate(firstMac, 1, Function(k, v) v + 1)
+        Macs.AddOrUpdate(lastMac, 1, Function(k, v) v + 1)
+        RecordRun(firstMac, quand)
+        RecordRun(lastMac, quand)
+        UpdateConflict()
         Return True
     End Function
+
+    Private Sub RecordRun(mac As String, quand As DateTime)
+        SyncLock _runsLock
+            Dim last = If(_runs.Count > 0, _runs(_runs.Count - 1), Nothing)
+            If last IsNot Nothing AndAlso last.Mac.Equals(mac, StringComparison.OrdinalIgnoreCase) Then
+                If quand > last.Fin Then last.Fin = quand
+            Else
+                _runs.Add(New MacRun With {.Mac = mac, .Debut = quand, .Fin = quand})
+                If _runs.Count > MaxRuns Then _runs.RemoveRange(0, _runs.Count - MaxRuns)
+            End If
+        End SyncLock
+    End Sub
+
+    ''' <summary>
+    ''' Conflit = 2 répondeurs à la même requête, ou alternance A → B → A en moins de AlternanceMax.
+    ''' Plusieurs MAC qui se succèdent sans retour = IP réattribuée (pas d'alerte).
+    ''' </summary>
+    Public Sub UpdateConflict()
+        Dim conflit = Not ResponderPairs.IsEmpty
+        Dim changements As Integer
+        SyncLock _runsLock
+            changements = _runs.Count - 1
+            If Not conflit Then
+                For i = 0 To _runs.Count - 3
+                    For j = i + 2 To _runs.Count - 1
+                        If _runs(j).Debut - _runs(i).Fin > AlternanceMax Then Exit For
+                        If _runs(j).Mac.Equals(_runs(i).Mac, StringComparison.OrdinalIgnoreCase) Then
+                            conflit = True
+                            Exit For
+                        End If
+                    Next
+                    If conflit Then Exit For
+                Next
+            End If
+        End SyncLock
+        If conflit Then
+            Flags = (Flags Or HostFlags.IpConflict) And Not HostFlags.Reassigned
+        ElseIf changements > 0 Then
+            Flags = (Flags Or HostFlags.Reassigned) And Not HostFlags.IpConflict
+        Else
+            Flags = Flags And Not (HostFlags.IpConflict Or HostFlags.Reassigned)
+        End If
+    End Sub
+
+    ''' <summary>Reprend l'historique d'un ancien résultat pour la même IP (fusion chronologique).</summary>
+    Public Sub MergeFrom(other As HostResult)
+        If other Is Nothing OrElse ReferenceEquals(other, Me) Then Return
+        For Each kv In other.Macs
+            Macs.AddOrUpdate(kv.Key, kv.Value, Function(k, v) v + kv.Value)
+        Next
+        For Each kv In other.ResponderPairs
+            ResponderPairs.AddOrUpdate(kv.Key, kv.Value, Function(k, v) v + kv.Value)
+        Next
+        Dim autres As List(Of MacRun)
+        SyncLock other._runsLock
+            autres = other._runs.Select(Function(r) New MacRun With {.Mac = r.Mac, .Debut = r.Debut, .Fin = r.Fin}).ToList()
+        End SyncLock
+        SyncLock _runsLock
+            Dim tous = autres.Concat(_runs).OrderBy(Function(r) r.Debut).ToList()
+            _runs.Clear()
+            For Each r In tous
+                Dim last = If(_runs.Count > 0, _runs(_runs.Count - 1), Nothing)
+                If last IsNot Nothing AndAlso last.Mac.Equals(r.Mac, StringComparison.OrdinalIgnoreCase) Then
+                    If r.Fin > last.Fin Then last.Fin = r.Fin
+                Else
+                    _runs.Add(r)
+                End If
+            Next
+            If _runs.Count > MaxRuns Then _runs.RemoveRange(0, _runs.Count - MaxRuns)
+        End SyncLock
+        UpdateConflict()
+    End Sub
+
+    ''' <summary>Dernière MAC vue pour cette IP.</summary>
+    Public ReadOnly Property CurrentMac As String
+        Get
+            SyncLock _runsLock
+                Return If(_runs.Count > 0, _runs(_runs.Count - 1).Mac, Nothing)
+            End SyncLock
+        End Get
+    End Property
+
+    ''' <summary>MAC qui ont précédé la MAC actuelle (IP réattribuée), la plus récente d'abord.</summary>
+    Public ReadOnly Property PreviousMacs As List(Of String)
+        Get
+            Dim cur = CurrentMac
+            SyncLock _runsLock
+                Return _runs.AsEnumerable().Reverse().Select(Function(r) r.Mac).
+                    Where(Function(m) Not m.Equals(cur, StringComparison.OrdinalIgnoreCase)).
+                    Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+            End SyncLock
+        End Get
+    End Property
+
+    ''' <summary>MAC réellement présentes : la seule MAC actuelle si l'IP a été réattribuée, sinon toutes.</summary>
+    Public ReadOnly Property ActiveMacs As IEnumerable(Of String)
+        Get
+            If Flags.HasFlag(HostFlags.Reassigned) AndAlso CurrentMac IsNot Nothing Then Return {CurrentMac}
+            Return Macs.Keys.ToList()
+        End Get
+    End Property
 
     Public ReadOnly Property ResponderText As String
         Get
@@ -157,13 +299,18 @@ Public Class HostResult
 
     Public ReadOnly Property MacList As String
         Get
+            ' IP réattribuée : seule la MAC actuelle est affichée (les précédentes vont dans les notes)
+            If Flags.HasFlag(HostFlags.Reassigned) AndAlso CurrentMac IsNot Nothing Then Return CurrentMac
             Return String.Join(" | ", Macs.OrderByDescending(Function(kv) kv.Value).
                 Select(Function(kv) If(Macs.Count > 1, $"{kv.Key} (x{kv.Value})", kv.Key)))
         End Get
     End Property
 
+    ''' <summary>MAC de référence : la dernière vue (ou la plus fréquente à défaut d'historique).</summary>
     Public ReadOnly Property PrimaryMac As String
         Get
+            Dim cur = CurrentMac
+            If cur IsNot Nothing Then Return cur
             Return Macs.OrderByDescending(Function(kv) kv.Value).Select(Function(kv) kv.Key).FirstOrDefault()
         End Get
     End Property
@@ -176,6 +323,7 @@ Public Class HostResult
             If Flags.HasFlag(HostFlags.WrongSubnet) Then s.Add("HORS RÉSEAU")
             If Flags.HasFlag(HostFlags.MacChanged) Then s.Add("MAC CHANGÉE")
             If Flags.HasFlag(HostFlags.SharedMac) Then s.Add("MAC multi-IP")
+            If Flags.HasFlag(HostFlags.Reassigned) Then s.Add("IP réattribuée")
             If Flags.HasFlag(HostFlags.LocalHost) Then s.Add("Ce PC")
             If Flags.HasFlag(HostFlags.Gateway) Then s.Add("Passerelle")
             If Flags.HasFlag(HostFlags.RandomMac) Then s.Add("MAC aléatoire")
@@ -289,12 +437,12 @@ Public Class Scanner
                                        Dim r = ProbeArpPair(opt.Iface, host.Ip, canPurge)
                                        stepDone += 1
                                        If r.First <> "" Then
-                                           Dim before = host.Macs.Count
+                                           Dim etaitConflit = host.Flags.HasFlag(HostFlags.IpConflict)
                                            Dim dual = host.AddProbe(r.First, r.Last)
                                            If dual Then
                                                progress?.Report(New ScanProgress With {.Host = host, .Message = $"[CONFLIT] {host.Ip} : 2 MAC ont répondu (1ère {r.First}, dernière {r.Last})"})
-                                           ElseIf host.Macs.Count > before AndAlso before > 0 Then
-                                               progress?.Report(New ScanProgress With {.Host = host, .Message = $"[CONFLIT] {host.Ip} : nouvelle MAC {r.First}"})
+                                           ElseIf Not etaitConflit AndAlso host.Flags.HasFlag(HostFlags.IpConflict) Then
+                                               progress?.Report(New ScanProgress With {.Host = host, .Message = $"[CONFLIT] {host.Ip} : MAC qui alternent ({host.MacList})"})
                                            End If
                                        End If
                                        progress?.Report(New ScanProgress With {.Done = total + CInt(CLng(total) * stepDone \ steps), .Total = total * 2})
@@ -494,8 +642,13 @@ Public Class Scanner
     ''' <summary>Analyse globale : MAC partagées, passerelle, MAC aléatoires, conflit avec ce PC.</summary>
     Public Shared Sub Analyze(list As List(Of HostResult), iface As LocalInterface)
         Dim macToIps As New Dictionary(Of String, List(Of HostResult))(StringComparer.OrdinalIgnoreCase)
+        ' les indicateurs et notes d'analyse sont recalculés entièrement (pas d'alerte qui reste après correction)
         For Each h In list
-            For Each m In h.Macs.Keys
+            h.Flags = h.Flags And Not (HostFlags.SharedMac Or HostFlags.DualInterface Or HostFlags.RandomMac)
+            h.AnalysisNotes = ""
+        Next
+        For Each h In list
+            For Each m In h.ActiveMacs
                 If Not macToIps.ContainsKey(m) Then macToIps(m) = New List(Of HostResult)
                 macToIps(m).Add(h)
             Next
@@ -515,8 +668,23 @@ Public Class Scanner
             If Not iface.InSubnet(h.Ip) Then
                 h.Flags = h.Flags Or HostFlags.WrongSubnet
                 Dim n = $"hors {FromHostUInt(ToHostUInt(iface.Address) And ToHostUInt(iface.Mask))}/{iface.PrefixLength}"
-                If Not h.Notes.Contains(n) Then h.Notes = If(h.Notes = "", n, h.Notes & " ; " & n)
+                h.AddAnalysisNote(n)
             End If
+        Next
+
+        ' IP réattribuée : indique la MAC précédente et où elle se trouve maintenant
+        For Each h In list
+            If Not h.Flags.HasFlag(HostFlags.Reassigned) Then Continue For
+            For Each m In h.PreviousMacs.Take(2)
+                Dim ailleurs As List(Of HostResult) = Nothing
+                Dim ou = ""
+                If macToIps.TryGetValue(m, ailleurs) Then
+                    Dim autres = ailleurs.Where(Function(x) Not ReferenceEquals(x, h)).Select(Function(x) Court(x.Ip, iface)).ToList()
+                    If autres.Count > 0 Then ou = " → " & String.Join(" ", autres)
+                End If
+                Dim note = $"avant : {m}{ou}"
+                h.AddAnalysisNote(note)
+            Next
         Next
 
         ' Appareil double interface : la même paire de MAC est en conflit sur plusieurs IP
@@ -532,7 +700,7 @@ Public Class Scanner
             For Each h In kv.Value
                 h.Flags = h.Flags Or HostFlags.DualInterface
                 Dim note = "aussi " & String.Join(" ", kv.Value.Where(Function(x) Not ReferenceEquals(x, h)).Select(Function(x) Court(x.Ip, iface)))
-                If Not h.Notes.Contains(note) Then h.Notes = If(h.Notes = "", note, h.Notes & " ; " & note)
+                h.AddAnalysisNote(note)
             Next
         Next
 
@@ -543,7 +711,7 @@ Public Class Scanner
                 For Each h In kv.Value
                     h.Flags = h.Flags Or HostFlags.SharedMac
                     Dim note = "aussi " & String.Join(" ", kv.Value.Where(Function(x) Not ReferenceEquals(x, h)).Select(Function(x) Court(x.Ip, iface)))
-                    If Not h.Notes.Contains(note) Then h.Notes = If(h.Notes = "", note, h.Notes & " ; " & note)
+                    h.AddAnalysisNote(note)
                 Next
             End If
         Next

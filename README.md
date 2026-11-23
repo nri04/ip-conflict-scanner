@@ -41,3 +41,9 @@ Clic droit → « Re-tester cette IP (20 passes ARP) » pour confirmer un confli
 - **Écoute passive ARP (Npcap)** : case à cocher, active si Npcap est installé (https://npcap.com, installé aussi par Wireshark). Capture toutes les trames ARP : voit chaque réponse (pas seulement la 1ère/dernière) et les appareils mal configurés dans un autre sous-réseau, invisibles autrement pour Windows.
 - **Base fabricants** : oui.csv téléchargé automatiquement au premier lancement (puis mis à jour s'il a plus de 6 mois), à côté de l'exe ou dans %LOCALAPPDATA%\IpConflictScanner.
 - Passes ARP par défaut : 3 (les sondes sont séquentielles pour éviter les faux conflits).
+
+## Ajouts v1.2
+
+- **IP réattribuée ≠ conflit** : chaque IP garde l'historique chronologique de ses MAC. Un conflit n'est signalé que si deux MAC répondent à la même requête, ou si une MAC revient après une autre en moins de 10 min (A → B → A). Une MAC remplacée par une autre sans retour (bail DHCP, téléphone à MAC aléatoire qui a changé d'IP) donne « IP réattribuée » (ligne normale), avec en note « avant : MAC → nouvelle IP ».
+- **Analyse recalculée** : « MAC multi-IP », « double interface » et leurs notes sont recalculés à chaque analyse (plus d'alerte qui reste après correction) ; une MAC partie sur une autre IP ne compte plus comme MAC multi-IP.
+- Surveillance : re-sondage séquentiel (les sondes ARP étaient déjà sérialisées), alerte sonore seulement sur conflit réel ou changement de MAC de la passerelle.

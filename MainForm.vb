@@ -23,6 +23,7 @@ Partial Public Class MainForm
     Private _pcap As PcapArp
     Private ReadOnly _dirty As New HashSet(Of UInteger)
     Private ReadOnly _alerted As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+    Private _boldFont As Font
     Private Const OuiUrl As String = "https://standards-oui.ieee.org/oui/oui.csv"
 
     Public Sub New()
@@ -207,20 +208,14 @@ Partial Public Class MainForm
         Dim cur As HostResult = Nothing
         If _hosts.TryGetValue(key, cur) Then
             If Not ReferenceEquals(cur, h) Then
-                ' le nouvel objet remplace l'ancien, en héritant de son historique (une seule fois)
-                For Each kv In cur.Macs
-                    For n = 1 To kv.Value
-                        h.AddMac(kv.Key)
-                    Next
-                Next
-                h.Flags = h.Flags Or (cur.Flags And (HostFlags.MacChanged Or HostFlags.SelfConflict Or HostFlags.IpConflict))
+                ' le nouvel objet remplace l'ancien, en héritant de son historique (une seule fois) ;
+                ' conflit / réattribution sont recalculés sur l'historique chronologique complet
+                h.MergeFrom(cur)
+                h.Flags = h.Flags Or (cur.Flags And (HostFlags.MacChanged Or HostFlags.SelfConflict))
                 If h.PingMs < 0 Then h.PingMs = cur.PingMs
                 If h.Hostname = "" Then h.Hostname = cur.Hostname
                 If cur.Notes <> "" AndAlso Not h.Notes.Contains(cur.Notes) Then h.Notes = If(h.Notes = "", cur.Notes, h.Notes & " ; " & cur.Notes)
                 If cur.LastSeen > h.LastSeen Then h.LastSeen = cur.LastSeen
-                For Each kv In cur.ResponderPairs
-                    h.ResponderPairs.AddOrUpdate(kv.Key, kv.Value, Function(k, v) v + kv.Value)
-                Next
                 _hosts(key) = h
                 cur = h
             End If
@@ -233,12 +228,13 @@ Partial Public Class MainForm
 
     ' ================== Affichage ==================
 
-    Private Sub UpdateRow(h As HostResult)
+    Private Sub UpdateRow(h As HostResult, Optional majResume As Boolean = True)
         Dim key = h.Ip.ToString()
         Dim visible = Not chkConflictsOnly.Checked OrElse h.Severity > 0
         Dim it As ListViewItem = If(lv.Items.ContainsKey(key), lv.Items(key), Nothing)
         If Not visible Then
             If it IsNot Nothing Then lv.Items.Remove(it)
+            If majResume Then UpdateSummary()
             Return
         End If
         If it Is Nothing Then
@@ -250,7 +246,7 @@ Partial Public Class MainForm
         End If
         it.Tag = h
         it.SubItems(1).Text = h.MacList
-        it.SubItems(2).Text = String.Join(" | ", h.Macs.Keys.Select(Function(m) _oui.Lookup(m)).Where(Function(v) v <> "").Distinct())
+        it.SubItems(2).Text = String.Join(" | ", h.ActiveMacs.Select(Function(m) _oui.Lookup(m)).Where(Function(v) v <> "").Distinct())
         it.SubItems(3).Text = h.Hostname
         it.SubItems(4).Text = If(h.PingMs >= 0, h.PingMs.ToString(), "-")
         it.SubItems(5).Text = h.StatusText
@@ -260,7 +256,8 @@ Partial Public Class MainForm
             Case 2
                 it.BackColor = Color.FromArgb(255, 205, 205)
                 it.ForeColor = Color.DarkRed
-                it.Font = New Font(lv.Font, FontStyle.Bold)
+                If _boldFont Is Nothing Then _boldFont = New Font(lv.Font, FontStyle.Bold)
+                it.Font = _boldFont
             Case 1
                 it.BackColor = Color.FromArgb(255, 235, 190)
                 it.ForeColor = Color.SaddleBrown
@@ -271,18 +268,18 @@ Partial Public Class MainForm
                 it.ForeColor = Color.Black
                 it.Font = lv.Font
         End Select
-        UpdateSummary()
+        If majResume Then UpdateSummary()
     End Sub
 
     Private Shared Function NotesOf(h As HostResult) As String
-        Return h.Notes   ' notes courtes ; le détail 1ère/dernière réponse reste dans le journal
+        Return h.AllNotes   ' notes courtes ; le détail 1ère/dernière réponse reste dans le journal
     End Function
 
     Private Sub RefreshList()
         lv.BeginUpdate()
         lv.Items.Clear()
         For Each h In _hosts.Values.OrderBy(Function(x) x.IpSort)
-            UpdateRow(h)
+            UpdateRow(h, False)
         Next
         ApplySort()
         lv.EndUpdate()
@@ -421,17 +418,13 @@ Partial Public Class MainForm
                                          ' 1) table ARP passive
                                          Dim arp = ReadArpTable(iface.IfIndex)
                                          ' 2) re-sondage actif des hôtes connus (purge + ARP)
+                                         ' ProbeArpPair est sérialisé (verrou global) : boucle simple, pas de threads bloqués
                                          Dim active As New List(Of Tuple(Of IPAddress, String, String))
-                                         Parallel.ForEach(known, New ParallelOptions With {.MaxDegreeOfParallelism = 16},
-                                                          Sub(ip)
-                                                              If ip.Equals(iface.Address) Then Return
-                                                              Dim r = Scanner.ProbeArpPair(iface, ip, admin)
-                                                              If r.First <> "" Then
-                                                                  SyncLock active
-                                                                      active.Add(Tuple.Create(ip, r.First, r.Last))
-                                                                  End SyncLock
-                                                              End If
-                                                          End Sub)
+                                         For Each ip In known
+                                             If ip.Equals(iface.Address) Then Continue For
+                                             Dim r = Scanner.ProbeArpPair(iface, ip, admin)
+                                             If r.First <> "" Then active.Add(Tuple.Create(ip, r.First, r.Last))
+                                         Next
                                          ' 3) état DAD de l'adresse locale
                                          Dim dup = LocalInterface.Enumerate().Any(Function(i) i.Address.Equals(iface.Address) AndAlso i.DadState = DuplicateAddressDetectionState.Duplicate)
                                          Return Tuple.Create(arp, active, dup)
@@ -454,14 +447,17 @@ Partial Public Class MainForm
                 If Not _hosts.TryGetValue(ToHostUInt(a.Item1), hh) Then Continue For
                 Dim pairKey = $"1ère={a.Item2} / dernière={a.Item3}"
                 Dim isNewPair = Not hh.ResponderPairs.ContainsKey(pairKey)
+                If a.Item2.Equals(a.Item3, StringComparison.OrdinalIgnoreCase) OrElse a.Item3 = "" Then Continue For ' sonde simple : traitée avec les observations
                 If hh.AddProbe(a.Item2, a.Item3) AndAlso isNewPair Then
                     Log($"[CONFLIT] {a.Item1} : 2 MAC répondent — {a.Item2} ({_oui.Lookup(a.Item2)}) et {a.Item3} ({_oui.Lookup(a.Item3)})")
                     alert = True
                 End If
             Next
+            ' observations dans l'ordre chronologique : table ARP (lue avant), puis sondes actives
             Dim obs As New List(Of Tuple(Of IPAddress, String))
             obs.AddRange(res.Item1.Select(Function(a) Tuple.Create(a.Ip, a.Mac)))
-            obs.AddRange(res.Item2.Select(Function(a) Tuple.Create(a.Item1, a.Item2)))
+            obs.AddRange(res.Item2.Where(Function(a) a.Item3 = "" OrElse a.Item2.Equals(a.Item3, StringComparison.OrdinalIgnoreCase)).
+                         Select(Function(a) Tuple.Create(a.Item1, a.Item2)))
             For Each o In obs
                 Dim ip = o.Item1, mac = o.Item2
                 Dim key = ip.ToString()
@@ -472,30 +468,39 @@ Partial Public Class MainForm
                     _hosts(ToHostUInt(ip)) = h
                     _arpHistory(key) = mac
                     Log($"[NOUVEAU] {ip} {mac} {_oui.Lookup(mac)}")
-                    UpdateRow(h)
+                    UpdateRow(h, False)
                     Continue For
                 End If
                 h.LastSeen = DateTime.Now
                 Dim prev As String = Nothing
                 _arpHistory.TryGetValue(key, prev)
-                ' alerte seulement si cette MAC n'a jamais été vue pour cette IP (évite les alertes en boucle sur un conflit connu)
-                If Not String.IsNullOrEmpty(prev) AndAlso Not prev.Equals(mac, StringComparison.OrdinalIgnoreCase) AndAlso Not h.Macs.ContainsKey(mac) Then
-                    h.Flags = h.Flags Or HostFlags.MacChanged
-                    h.AddMac(mac)
-                    Dim isGw = iface.Gateway IsNot Nothing AndAlso ip.Equals(iface.Gateway)
-                    Log($"[ALERTE] {ip} : MAC {prev} → {mac} ({_oui.Lookup(mac)})" &
-                        If(isGw, "  *** PASSERELLE : conflit ou usurpation ARP possible ***", "  conflit IP probable"))
+                Dim etaitConflit = h.Flags.HasFlag(HostFlags.IpConflict)
+                Dim nouvelleMac = Not String.IsNullOrEmpty(prev) AndAlso Not prev.Equals(mac, StringComparison.OrdinalIgnoreCase) AndAlso Not h.Macs.ContainsKey(mac)
+                h.AddMac(mac)
+                Dim isGw = iface.Gateway IsNot Nothing AndAlso ip.Equals(iface.Gateway)
+                If Not etaitConflit AndAlso h.Flags.HasFlag(HostFlags.IpConflict) Then
+                    ' une MAC déjà vue revient après une autre : deux appareils se disputent l'IP
+                    Log($"[CONFLIT] {ip} : MAC qui alternent — {h.MacList}" &
+                        If(isGw, "  *** PASSERELLE : usurpation ARP possible ***", ""))
                     alert = True
-                Else
-                    h.AddMac(mac)
+                ElseIf nouvelleMac Then
+                    If isGw Then
+                        h.Flags = h.Flags Or HostFlags.MacChanged
+                        Log($"[ALERTE] {ip} : MAC {prev} → {mac} ({_oui.Lookup(mac)})  *** PASSERELLE : conflit ou usurpation ARP possible ***")
+                        alert = True
+                    Else
+                        ' l'ancienne MAC ne répond plus : nouvel appareil sur cette IP (bail DHCP), pas un conflit
+                        Log($"[INFO] {ip} réattribuée : {prev} → {mac} ({_oui.Lookup(mac)})")
+                    End If
                 End If
                 _arpHistory(key) = mac
-                UpdateRow(h)
+                UpdateRow(h, False)
             Next
             Scanner.Analyze(_hosts.Values.ToList(), iface)
-            For Each h In _hosts.Values.Where(Function(x) x.Severity > 0)
-                UpdateRow(h)
+            For Each h In _hosts.Values.Where(Function(x) x.Severity > 0 OrElse x.Flags.HasFlag(HostFlags.Reassigned))
+                UpdateRow(h, False)
             Next
+            UpdateSummary()
             If alert Then System.Media.SystemSounds.Exclamation.Play()
             lblStatus.Text = $"Surveillance : dernier passage {DateTime.Now:HH:mm:ss} ({obs.Count} observations)"
         Catch ex As Exception
@@ -703,14 +708,19 @@ Partial Public Class MainForm
                 Log($"[HORS SOUS-RÉSEAU] {pkt.SenderIp} {mac} {_oui.Lookup(mac)} : IP incompatible avec {iface.Address}/{iface.PrefixLength}")
                 System.Media.SystemSounds.Exclamation.Play()
             End If
-        ElseIf h.Macs.Count > 0 AndAlso Not h.Macs.ContainsKey(mac) Then
-            Dim alertKey = $"{pkt.SenderIp}|{mac}"
-            If _alerted.Add(alertKey) Then
-                Log($"[CONFLIT] {pkt.SenderIp} : {mac} ({_oui.Lookup(mac)}) répond aussi — déjà vue : {String.Join(", ", h.Macs.Keys)} (écoute passive{If(pkt.IsGratuitous, ", annonce gratuite", "")})")
+        End If
+        Dim dejaVues = String.Join(", ", h.Macs.Keys)
+        Dim nouvelleMac = h.Macs.Count > 0 AndAlso Not h.Macs.ContainsKey(mac)
+        Dim etaitConflit = h.Flags.HasFlag(HostFlags.IpConflict)
+        h.AddMac(mac)
+        If Not etaitConflit AndAlso h.Flags.HasFlag(HostFlags.IpConflict) Then
+            If _alerted.Add($"{pkt.SenderIp}|{mac}") Then
+                Log($"[CONFLIT] {pkt.SenderIp} : {mac} ({_oui.Lookup(mac)}) répond en alternance avec {String.Join(", ", h.Macs.Keys.Where(Function(m) Not m.Equals(mac, StringComparison.OrdinalIgnoreCase)))} (écoute passive{If(pkt.IsGratuitous, ", annonce gratuite", "")})")
                 System.Media.SystemSounds.Exclamation.Play()
             End If
+        ElseIf nouvelleMac Then
+            Log($"[INFO] {pkt.SenderIp} : nouvelle MAC {mac} ({_oui.Lookup(mac)}), avant : {dejaVues} (écoute passive)")
         End If
-        h.AddMac(mac)
         h.Flags = h.Flags Or HostFlags.Passive
         h.LastSeen = DateTime.Now
         _dirty.Add(key)
@@ -722,12 +732,13 @@ Partial Public Class MainForm
         lv.BeginUpdate()
         For Each k In _dirty
             Dim h As HostResult = Nothing
-            If _hosts.TryGetValue(k, h) Then UpdateRow(h)
+            If _hosts.TryGetValue(k, h) Then UpdateRow(h, False)
         Next
         For Each h In _hosts.Values.Where(Function(x) x.Severity > 0)
-            UpdateRow(h)
+            UpdateRow(h, False)
         Next
         lv.EndUpdate()
+        UpdateSummary()
         _dirty.Clear()
     End Sub
 
@@ -735,6 +746,7 @@ Partial Public Class MainForm
         StopPcap()
         monitorTimer.Stop()
         _cts?.Cancel()
+        _boldFont?.Dispose()
         MyBase.OnFormClosing(e)
     End Sub
 
