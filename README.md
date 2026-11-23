@@ -2,7 +2,7 @@
 
 Scan d'un réseau local IPv4 : IP, MAC, fabricant, nom d'hôte, ping — avec détection des conflits d'IP.
 
-[Télécharger la dernière version (IpConflictScanner.zip)](https://github.com/nri04/ip-conflict-scanner/releases/latest/download/IpConflictScanner.zip)
+[Télécharger la dernière version windows (IpConflictScanner.zip)](https://github.com/nri04/ip-conflict-scanner/releases/latest/download/IpConflictScanner.zip)
 
 ## Compilation
 
